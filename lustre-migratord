@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+#
+# Copyright (C) 2025
+#      The Board of Trustees of the Leland Stanford Junior University
+# Written by Stephane Thiell <sthiell@stanford.edu>
+#
+# Licensed under GPL v3 (see https://www.gnu.org/licenses/).
+
+import logging
+import sys
+
+import click
+
+from lib.common import get_short_hostname, setup_logging
+from lib.leader import Daemon
+
+
+@click.command()
+@click.option(
+    '--campaign',
+    required=True,
+    help='The name of the migration campaign.'
+)
+@click.option(
+    '--log-level',
+    default='INFO',
+    type=click.Choice(
+        ['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+        case_sensitive=False
+    ),
+    help='Set the logging level.'
+)
+@click.option(
+    '--dry-run',
+    is_flag=True,
+    help='Simulate migration without making changes.'
+)
+@click.option(
+    '--scan-workers',
+    default=4,
+    type=int,
+    show_default=True,
+    help='Number of concurrent "lfs find" processes on this node.'
+)
+@click.option(
+    '--migration-workers',
+    default=4,
+    type=int,
+    show_default=True,
+    help='Number of concurrent "lfs migrate" processes on this node.'
+)
+@click.option(
+    '--max-pending-migrations',
+    default=10_000_000,
+    type=int,
+    show_default=True,
+    help='Pause scanning when the migration queue size exceeds this limit, to control memory usage.'
+)
+def main(campaign, log_level, dry_run, scan_workers, migration_workers, max_pending_migrations):
+    """Lustre OST Migration Daemon (lustre-migratord)."""
+    # Use the short hostname in the logger for consistency
+    hostname = get_short_hostname()
+    setup_logging(name=f'lustre-migratord:{hostname}', level_str=log_level)
+
+    if scan_workers < 1 or migration_workers < 1:
+        click.echo("Error: Worker counts must be at least 1.", err=True)
+        sys.exit(1)
+
+    daemon = Daemon(
+        campaign_name=campaign,
+        log_level=log_level,
+        dry_run=dry_run,
+        num_scan_workers=scan_workers,
+        num_migration_workers=migration_workers,
+        max_pending_migrations=max_pending_migrations
+    )
+
+    was_clean_shutdown = daemon.run()
+
+    if not was_clean_shutdown:
+        logging.critical(
+            "Daemon exited due to an error. Exiting with status 1 to trigger "
+            "restart by systemd."
+        )
+        sys.exit(1)
+
+    logging.info("Daemon exited cleanly. Exiting with status 0.")
+    sys.exit(0)
+
+
+if __name__ == '__main__':
+    main()

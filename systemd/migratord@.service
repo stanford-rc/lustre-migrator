@@ -1,0 +1,49 @@
+#
+# /etc/systemd/system/lustre-migratord@.service
+#
+# To use this template:
+# 1. Edit the ExecStart line to point to the correct path of your 'lustre-migratord' executable.
+# 2. Adjust the worker and memory-limiting values based on your node's capabilities.
+# 3. Place this file in /etc/systemd/system/.
+# 4. Run 'sudo systemctl daemon-reload'.
+# 5. Enable and start the service for a campaign, e.g.:
+#    sudo systemctl start lustre-migratord@my-campaign
+#
+[Unit]
+Description=Lustre Migrator Daemon for campaign %i
+# Ensures the network and shared filesystems are ready before starting.
+# This is critical for the high-availability leader election and persistent state.
+After=network-online.target remote-fs.target
+Wants=network-online.target remote-fs.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+# The main command to start the daemon.
+# - %i is replaced by the campaign name (e.g., "io5-pass1" from "lustre-migratord@io5-pass1.service").
+# - --scan-workers: Controls how many 'lfs find' processes run concurrently. Tune this
+#   based on the load your Lustre Metadata Servers (MDS) can handle.
+# - --migration-workers: Controls how many 'lfs migrate' processes run concurrently.
+#   Tune this based on your node's CPU, memory, and network bandwidth for data movement.
+# - --max-pending-migrations: Pauses file discovery when the number of files waiting
+#   to be migrated exceeds this limit. This is a critical memory management tool for
+#   the leader node on very large campaigns (e.g., >20 million files). For a leader
+#   with 16GB of RAM, a limit of 25000000 (25M) is a safe starting point.
+# - --dry-run: Add this flag to NOT perform any actual file migration but do the
+#   scanning and log fake migrations.
+#
+# IMPORTANT: You MUST replace '/opt/lustre-migrator/lustre-migratord' with the actual path.
+ExecStart=/opt/lustre-migrator/lustre-migratord --campaign %i --log-level INFO --scan-workers 4 --migration-workers 8 --max-pending-migrations 25000000
+
+# This is the core of the high-availability mechanism.
+# If the daemon exits with a non-zero status code (e.g., due to losing connection
+# to the leader), systemd will automatically restart it after a 10-second delay.
+# The restarted process will then re-join the cluster or attempt to become the new leader.
+Restart=on-failure
+RestartSec=10
+
+[Install]
+# This allows the service to be enabled to start on boot.
+WantedBy=multi-user.target

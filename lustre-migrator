@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+#
+# Copyright (C) 2025
+#      The Board of Trustees of the Leland Stanford Junior University
+# Written by Stephane Thiell <sthiell@stanford.edu>
+#
+# Licensed under GPL v3 (see https://www.gnu.org/licenses/).
+
+import glob
+import json
+import os
+import time
+from datetime import timedelta
+
+import click
+from ClusterShell.NodeSet import NodeSet
+
+from lib.common import (
+    APP_CONFIG, CONFIG_FILE, INITIAL_JOBS_FILE, get_campaign_path,
+    get_redis_connection, key
+)
+
+# --- Color Definitions for Status Command ---
+# A rotating list of colors to assign to each unique host.
+HOST_COLORS = ['cyan', 'magenta', 'yellow', 'blue', 'red', 'green']
+
+# A map for specific state colors.
+STATE_COLORS = {
+    'RUNNING': 'green',
+    'PAUSED': 'yellow',
+    'PAUSING': 'bright_yellow',
+    'COMPLETED': 'bright_blue',
+    'N/A': 'red',
+}
+
+
+def format_bytes(byte_count: float) -> str:
+    """Formats a byte count into a human-readable string (e.g., GiB/s)."""
+    if byte_count is None or byte_count < 0:
+        return "0 B"
+    power = 1024
+    n = 0
+    power_labels = {0: '', 1: 'K', 2: 'M', 3: 'G', 4: 'T', 5: 'P'}
+    while byte_count >= power and n < len(power_labels) - 1:
+        byte_count /= power
+        n += 1
+    # Use 'iB' for standards-compliance (e.g., GiB not GB)
+    return f"{byte_count:.2f} {power_labels[n]}iB"
+
+
+@click.group()
+def cli():
+    """Lustre OST Migration CLI (lustre-migrator)."""
+    if APP_CONFIG.config_path:
+        click.echo(
+            f"INFO: Using configuration from {APP_CONFIG.config_path}", err=True
+        )
+    else:
+        click.echo("INFO: No lustre-migrator.conf found, using default settings.", err=True)
+
+@cli.command()
+@click.option(
+    '--name', required=True, help='Unique name for the new campaign.'
+)
+@click.option(
+    '--osts', required=True, help='Range of OSTs to migrate (e.g., 192-271).'
+)
+@click.option(
+    '--scan-path', 'scan_paths', multiple=True, required=True,
+    help='Directory to scan. Use quotes for globbing (e.g., "/path/*/*").'
+)
+@click.option(
+    '--exclude-path', 'exclude_paths', multiple=True, help='Directory to exclude.'
+)
+def start(name, osts, scan_paths, exclude_paths):
+    """Starts a new migration campaign."""
+    campaign_path = get_campaign_path(name)
+    click.echo(f"Creating new campaign '{name}' at {campaign_path}")
+    if os.path.exists(campaign_path):
+        click.echo(f"Error: Campaign path {campaign_path} already exists.", err=True)
+        return
+    os.makedirs(campaign_path)
+    initial_jobs = sorted(list(set(
+        job for p in scan_paths for job in glob.glob(p)
+    )))
+    if not any(initial_jobs):
+        click.echo("Warning: Scan path patterns did not match any files.", err=True)
+    config = {
+        "campaign_name": name,
+        "target_osts": osts,
+        "scan_path_patterns": list(scan_paths),
+        "exclude_paths": list(exclude_paths),
+        "migration_flags": "-n"
+    }
+    with open(os.path.join(campaign_path, CONFIG_FILE), 'w') as f:
+        json.dump(config, f, indent=2)
+    if initial_jobs:
+        with open(os.path.join(campaign_path, INITIAL_JOBS_FILE), 'w') as f:
+            for job in initial_jobs:
+                f.write(f"{job}\n")
+        click.echo(f"Successfully created campaign '{name}' with {len(initial_jobs)} jobs.")
+        click.echo(f"(Hint: systemctl start lustre-migratord@{name})")
+    else:
+        click.echo("Error: No initial scan jobs generated.", err=True)
+        os.remove(os.path.join(campaign_path, CONFIG_FILE))
+        os.rmdir(campaign_path)
+
+
+@cli.command()
+@click.argument('campaign')
+def reprime(campaign):
+    """Resets the initial scan jobs file to be re-processed by the leader."""
+    campaign_path = get_campaign_path(campaign)
+    jobs_file = os.path.join(campaign_path, INITIAL_JOBS_FILE)
+    processed_file = jobs_file + ".processed"
+    if not os.path.exists(campaign_path):
+        click.echo(f"Error: Campaign '{campaign}' does not exist.", err=True)
+        return
+    if os.path.exists(jobs_file):
+        click.echo(f"Initial jobs file '{jobs_file}' already exists. No action needed.")
+        return
+    if os.path.exists(processed_file):
+        click.echo(f"Found processed jobs file: {processed_file}")
+        try:
+            os.rename(processed_file, jobs_file)
+            click.echo(f"Successfully renamed to: {jobs_file}")
+            click.echo(f"(Hint: systemctl restart lustre-migratord@{campaign})")
+        except OSError as e:
+            click.echo(f"Error renaming file: {e}", err=True)
+    else:
+        click.echo(f"Error: Neither '{jobs_file}' nor '{processed_file}' found.", err=True)
+
+
+def format_rate(rate: float) -> str:
+    """Dynamically formats a rate for human-readable output."""
+    if rate >= 100:
+        return f"{rate:,.0f}"
+    if rate >= 1:
+        return f"{rate:.1f}"
+    return f"{rate:.3f}"
+
+
+@cli.command()
+@click.argument('campaign')
+def status(campaign):
+    """Shows the status of a migration campaign with colors."""
+    try:
+        r = get_redis_connection(campaign)
+
+        pipe = r.pipeline()
+        pipe.hgetall(key(campaign, 'campaign:state'))
+        pipe.scard(key(campaign, 'sets:discovered'))
+        pipe.scard(key(campaign, 'sets:succeeded'))
+        pipe.scard(key(campaign, 'sets:failed'))
+        pipe.hgetall(key(campaign, 'migrations:inprogress'))
+        pipe.llen(key(campaign, 'queues:scan'))
+        pipe.llen(key(campaign, 'queues:migrate'))
+        pipe.hkeys(key(campaign, 'status'))
+        pipe.hgetall(key(campaign, 'scans:inprogress'))
+        pipe.hgetall(key(campaign, 'scans:counts'))
+        pipe.hgetall(key(campaign, 'rates:migrate'))
+        pipe.hgetall(key(campaign, 'rates:scan'))
+        pipe.get(key(campaign, 'metrics:bytes_succeeded'))
+        pipe.hgetall(key(campaign, 'rates:bandwidth'))
+        pipe.get(key(campaign, 'metrics:bytes_failed'))
+        pipe.get(key(campaign, 'scan:throttling_active'))
+        results = pipe.execute()
+
+        state_raw, discovered, succeeded, failed, active_migrations_raw, scan_q, \
+            migrate_q, workers_raw, active_scans_raw, scan_counts_raw, \
+            migrate_rates_raw, scan_rates_raw, bytes_succeeded_raw, \
+            bandwidth_rates_raw, bytes_failed_raw, is_throttled_raw = results
+
+        state = {k.decode(): v.decode() for k, v in state_raw.items()}
+        active_migrations = {
+            k.decode(): v.decode('utf-8', 'ignore')
+            for k, v in active_migrations_raw.items()
+        }
+        in_progress = len(active_migrations)
+
+        active_scans = {k.decode(): v.decode() for k, v in active_scans_raw.items()}
+        scan_counts = {k.decode(): int(v) for k, v in scan_counts_raw.items()}
+        migrate_rates = {k.decode(): float(v) for k, v in migrate_rates_raw.items()}
+        scan_rates = {k.decode(): float(v) for k, v in scan_rates_raw.items()}
+        workers = [w.decode() for w in workers_raw]
+        bytes_succeeded = int(bytes_succeeded_raw or 0)
+        bandwidth_rates = {k.decode(): float(v) for k, v in bandwidth_rates_raw.items()}
+        bytes_failed = int(bytes_failed_raw or 0)
+        is_throttled = is_throttled_raw is not None
+
+        # --- Color Assignment Logic ---
+        all_hosts = set(state.get('leader', ''))
+        all_hosts.update(workers)
+        all_hosts.update(scanner.split(':')[0] for scanner in active_scans)
+        all_hosts.update(migrator.split(':')[0] for migrator in active_migrations)
+        all_hosts.discard('')
+
+        host_color_map = {
+            host: HOST_COLORS[i % len(HOST_COLORS)]
+            for i, host in enumerate(sorted(list(all_hosts)))
+        }
+
+        # --- Styled Output ---
+        click.echo(f"--- Campaign Status: {click.style(campaign, bold=True)} ---")
+
+        status_str = state.get('status', 'N/A').upper()
+        status_color = STATE_COLORS.get(status_str, 'white')
+        leader_name = state.get('leader', 'N/A')
+        leader_color = host_color_map.get(leader_name, 'white')
+        click.echo(
+            f"State: {click.style(status_str, fg=status_color, bold=True)} | "
+            f"Leader: {click.style(leader_name, fg=leader_color, bold=True)}"
+        )
+
+        if workers:
+            nodeset_str = str(NodeSet.fromlist(workers))
+            click.echo(
+                f"Active Workers: {click.style(str(len(workers)), bold=True)} "
+                f"({click.style(nodeset_str, dim=True)})"
+            )
+        else:
+            click.echo("Active Workers: 0")
+
+        files_remaining = discovered - (succeeded + failed)
+        global_rate_ps = sum(migrate_rates.values())
+        global_scan_rate_ps = sum(scan_rates.values())
+        global_bandwidth_bps = sum(bandwidth_rates.values())
+        scans_are_running = scan_q > 0 or len(active_scans) > 0
+
+        eta_str = click.style("Calculating...", dim=True)
+        if scans_are_running:
+            # When scanning, the total number of files is unknown, so ETA is not applicable.
+            eta_str = click.style("N/A", fg='yellow')
+        elif files_remaining <= 0 and discovered > 0:
+            eta_str = click.style("Complete.", fg='green', bold=True)
+        elif global_rate_ps > 0:
+            seconds_remaining = files_remaining / global_rate_ps
+            max_days_in_secs = 99999 * 24 * 3600
+            if seconds_remaining > max_days_in_secs:
+                eta_str = "> 99999 days"
+            else:
+                eta_delta = timedelta(seconds=seconds_remaining) - timedelta(microseconds=timedelta(seconds=seconds_remaining).microseconds)
+                eta_str = f"{eta_delta}"
+        elif discovered > 0:
+            # If migrations are active but rate is 0 (just started), it's not "Stalled"
+            if in_progress > 0:
+                eta_str = click.style("Calculating...", dim=True)
+            else:
+                eta_str = click.style("Stalled (rate is 0)", fg='red', bold=True)
+
+        if discovered > 0:
+            percent_done = (succeeded / discovered) * 100
+            bar_len = 30
+            filled_len = int(bar_len * percent_done / 100)
+            bar_fill = click.style('█' * filled_len, fg='green')
+            bar_empty = click.style('─' * (bar_len - filled_len), dim=True)
+
+            bandwidth_str = ""
+            # Always show migration bandwidth if it's non-zero.
+            if global_bandwidth_bps > 0:
+                bandwidth_str = f" at {format_bytes(global_bandwidth_bps)}/s"
+
+            total_migrated_size = format_bytes(bytes_succeeded)
+
+            click.echo(
+                f"\nProgress: {click.style(f'{succeeded:,}', bold=True)} / "
+                f"{discovered:,} files migrated ({percent_done:.2f}%) "
+                f"({click.style(total_migrated_size, bold=True)})"
+            )
+            click.echo(f"[{bar_fill}{bar_empty}] | ETA: {eta_str}{bandwidth_str}")
+
+        succeeded_str = click.style(f'{succeeded:,}', fg='bright_green')
+        failed_color = 'red' if failed > 0 else 'white'
+        failed_str = click.style(f'{failed:,}', fg=failed_color, bold=failed > 0)
+        if failed > 0 and bytes_failed > 0:
+            failed_bytes_str = click.style(f" ({format_bytes(bytes_failed)})", fg=failed_color, bold=True)
+            failed_str += failed_bytes_str
+        click.echo(f"  - Succeeded: {succeeded_str}")
+        click.echo(f"  - Failed: {failed_str}")
+
+        click.echo(f"\n{click.style('Activity:', bold=True)}")
+        migrate_rate_str = format_rate(global_rate_ps)
+        scan_rate_str = format_rate(global_scan_rate_ps)
+
+        # Display list of migrating files
+        if active_migrations:
+            click.echo(
+                f"  - Migrations In Progress ({in_progress}) "
+                f"(Migration Rate: {click.style(migrate_rate_str, bold=True)} files/sec):"
+            )
+            for worker_id, file_path in sorted(active_migrations.items()):
+                host = worker_id.split(':')[0]
+                host_color = host_color_map.get(host, 'white')
+                worker_str = click.style(worker_id, fg=host_color)
+                click.echo(f"    - {file_path} (on {worker_str})")
+        else:
+             click.echo(f"  - Migrations In Progress: 0")
+
+        throttled_str = ""
+        if is_throttled:
+            throttled_str = click.style(" [THROTTLED]", fg='bright_yellow', bold=True)
+
+        if active_scans:
+            click.echo(
+                f"  - Scans In Progress ({len(active_scans)}) "
+                f"(Discovery Rate: {click.style(scan_rate_str, bold=True)} files/sec){throttled_str}:"
+            )
+            for scanner, path in sorted(active_scans.items()):
+                host = scanner.split(':')[0]
+                host_color = host_color_map.get(host, 'white')
+                count_str = click.style(f"({scan_counts.get(scanner, 0):,} files)", dim=True)
+                scanner_str = click.style(scanner, fg=host_color)
+                click.echo(f"    - {path} {count_str} (on {scanner_str})")
+        else:
+            recent_rate_str = ""
+            if global_scan_rate_ps > 0:
+                recent_rate_str = f" (Recent Rate: {scan_rate_str} files/sec)"
+            click.echo(f"  - Scans In Progress: 0{recent_rate_str}{throttled_str}")
+
+        click.echo(f"\n{click.style('Queues:', bold=True)}")
+        click.echo(f"  - Scan Jobs Pending: {scan_q:,}")
+        click.echo(f"  - Migrate Jobs Pending: {migrate_q:,}")
+
+    except Exception as e:
+        click.echo(click.style(f"Error fetching status: {e}", fg='red'), err=True)
+
+@cli.command()
+@click.argument('campaign')
+def pause(campaign):
+    """Pauses the campaign, waiting for in-progress jobs to finish."""
+    try:
+        r = get_redis_connection(campaign)
+        r.hset(key(campaign, 'campaign:state'), 'status', 'pausing')
+        click.echo("Instructing workers to pause...")
+        while True:
+            migrations_in_progress = r.hlen(key(campaign, 'migrations:inprogress'))
+            scans_in_progress = r.hlen(key(campaign, 'scans:inprogress'))
+            if migrations_in_progress == 0 and scans_in_progress == 0:
+                break
+            click.echo(
+                f"Waiting for {migrations_in_progress} migration(s) and "
+                f"{scans_in_progress} scan(s) to finish..."
+            )
+            time.sleep(2)
+        r.hset(key(campaign, 'campaign:state'), 'status', 'paused')
+        click.echo(f"Campaign '{campaign}' is now paused.")
+    except Exception as e:
+        click.echo(f"Error pausing campaign: {e}", err=True)
+
+@cli.command()
+@click.argument('campaign')
+def resume(campaign):
+    """Resumes a paused campaign."""
+    try:
+        r = get_redis_connection(campaign)
+        r.hset(key(campaign, 'campaign:state'), 'status', 'running')
+        click.echo(f"Campaign '{campaign}' resumed.")
+    except Exception as e:
+        click.echo(f"Error resuming campaign: {e}", err=True)
+
+@cli.command()
+@click.argument('campaign')
+def retry_failed(campaign):
+    """Re-queues all failed files for another migration attempt."""
+    try:
+        r = get_redis_connection(campaign)
+        failed_files = r.smembers(key(campaign, 'sets:failed'))
+        if not failed_files:
+            click.echo("No failed files to retry.")
+            return
+        click.echo(f"Re-queueing {len(failed_files)} failed files...")
+        error_keys = set(r.hkeys(key(campaign, 'errors')))
+        files_to_remove = error_keys.intersection(failed_files)
+        pipe = r.pipeline()
+        pipe.rpush(key(campaign, 'queues:migrate'), *failed_files)
+        pipe.srem(key(campaign, 'sets:failed'), *failed_files)
+        if files_to_remove:
+            pipe.hdel(key(campaign, 'errors'), *files_to_remove)
+        pipe.execute()
+        click.echo("Done.")
+    except Exception as e:
+        click.echo(f"Error re-queueing failed files: {e}", err=True)
+
+
+if __name__ == '__main__':
+    cli()
