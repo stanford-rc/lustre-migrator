@@ -27,6 +27,7 @@ A `lustre-migratord` instance that successfully acquires the file lock becomes t
 1.  **Run the Central Job Broker**: It starts and manages an **embedded `redis-server` process**. This Redis instance acts as the central nervous system for the campaign, holding job queues and real-time state. To enhance security, it is configured to require a password, which is automatically set to the campaign name.
 2.  **Perform Work**: In addition to its leadership duties, the leader node also runs its own pool of scan and migration worker threads, contributing to the overall effort just like any follower.
 
+
 ### 2.3. The Follower Daemons
 
 Any `lustre-migratord` instance that fails to acquire the lock becomes a follower. Its role is simple:
@@ -54,8 +55,8 @@ The following diagram illustrates the interaction between the components:
 |  | |-----------------------| |                        |  |  | |-----------------------| | |
 |  | | - scan_queue          | |                        |  |  | | - lfs find            | | |
 |  | | - migrate_queue       | |                        |  |  | | - lfs migrate         | | |
-|  | | - sets: discovered    | |                        |  |  | | - ...                 | | |
-|  | | - sets: succeeded     | |                        |  |  | +-----------------------+ | |
+|  | | - counters:discovered | |                        |  |  | | - ...                 | | |
+|  | | - counters:succeeded  | |                        |  |  | +-----------------------+ | |
 |  | | - ...                 | |                        |  |  |                           | |
 |  | +-----------------------+ |                        |  |  |                           | |
 |  +---------------------------+     +--------------------)---+  +---------------------------+ |
@@ -91,15 +92,15 @@ The following diagram illustrates the interaction between the components:
     -   Daemons that failed to get the lock read `leader.info`.
     -   They connect to the leader's Redis instance.
 6.  **Scanning Phase**:
-    -   A worker thread on any node (leader or follower) performs a blocking pop (`BLPOP`) on the `queues:scan` queue.
-    -   Upon receiving a directory path, it executes `lfs find` to discover files on the target OSTs.
-    -   It batches the discovered file paths and pushes them to two places in Redis:
-        -   The `sets:discovered` set (for progress tracking).
-        -   The `queues:migrate` list (for the next phase).
+    -   A worker thread on any node performs `BLPOP` on `queues:scan`.
+    -   It executes `lfs find` to discover files.
+    -   It batches the discovered file paths and executes two Redis commands:
+        -   `RPUSH ...:queues:migrate ...` (to add files to the work queue)
+        -   `INCRBY ...:counters:discovered ...` (to increment a simple number)
 7.  **Migration Phase**:
-    -   A worker thread on any node performs a `BLPOP` on the `queues:migrate` queue.
-    -   Upon receiving a file path, it executes `lfs migrate` on that file.
-    -   Based on the result, it adds the file path to either the `sets:succeeded` or `sets:failed` set in Redis.
+    -   A worker thread performs `BLPOP` on `queues:migrate`.
+    -   It executes `lfs migrate` on the file.
+    -   Based on the return code, it increments the appropriate counter (`succeeded`, `failed`, or `skipped`) and, if necessary, adds the file path to a corresponding `SET` for later retry operations.
 
 This process continues until all queues (`scan` and `migrate`) are empty and no jobs are in progress.
 

@@ -1,3 +1,9 @@
+# Copyright (C) 2025
+#      The Board of Trustees of the Leland Stanford Junior University
+# Written by Stephane Thiell <sthiell@stanford.edu>
+#
+# Licensed under GPL v3 (see https://www.gnu.org/licenses/).
+
 import logging
 import os
 import signal
@@ -43,6 +49,7 @@ class Worker:
         self.scans_completed = 0
         self.files_migrated_succeeded = 0
         self.files_migrated_failed = 0
+        self.files_migrated_skipped = 0
         self.migrate_rate_tracker: List[float] = []
         self.found_files_rate_tracker: List[tuple] = []
         self.bandwidth_rate_tracker: List[tuple] = []
@@ -84,7 +91,7 @@ class Worker:
                 failed_path, 'a', buffering=buffer_size, encoding='utf-8'
             )
             logging.info("Writing successful migrations to: %s", succeeded_path)
-            logging.info("Writing failed migrations to: %s", failed_path)
+            logging.info("Writing failed migrations (real errors) to: %s", failed_path)
         except OSError as e:
             logging.error("FATAL: Failed to open compliance log files: %s", e)
             self.succeeded_log_file = None
@@ -261,7 +268,7 @@ class Worker:
 
                             # Now push the batch to Redis.
                             pipe = self.r.pipeline()
-                            pipe.sadd(key(self.campaign_name, 'sets:discovered'), *batch)
+                            pipe.incrby(key(self.campaign_name, 'counters:discovered'), len(batch))
                             pipe.rpush(key(self.campaign_name, 'queues:migrate'), *batch)
                             pipe.hset(scans_counts_key, worker_thread_id, files_found_count)
                             pipe.execute()
@@ -282,7 +289,7 @@ class Worker:
                 # Push any final, valid batch of files.
                 if batch:
                     pipe = self.r.pipeline()
-                    pipe.sadd(key(self.campaign_name, 'sets:discovered'), *batch)
+                    pipe.incrby(key(self.campaign_name, 'counters:discovered'), len(batch))
                     pipe.rpush(key(self.campaign_name, 'queues:migrate'), *batch)
                     pipe.execute()
                     self._update_found_files_rate(len(batch))
@@ -346,7 +353,6 @@ class Worker:
                 pipe.execute()
             except redis.exceptions.RedisError as e:
                 logging.warning("Failed to perform final cleanup for scan job: %s", e)
-
             # Force report rates after every job attempt to ensure the final
             # rate of a completed scan is not missed due to throttling.
             self._report_rates(force=True)
@@ -366,15 +372,16 @@ class Worker:
             file_size = os.stat(file_path_str).st_size
         except FileNotFoundError:
             logging.warning("File not found before migration, skipping: %s", file_path_str)
-            # This isn't a failure of the tool, the file is just gone.
-            # We remove it from the 'discovered' set to keep counts accurate.
-            self.r.srem(key(self.campaign_name, 'sets:discovered'), file_path_bytes)
+            # File is gone, so it's not succeeded or failed, just discovered and vanished.
+            self.r.decr(key(self.campaign_name, 'counters:discovered'))
             return True
         except OSError as e:
             logging.error("Could not stat file %s, marking as failed: %s", file_path_str, e)
             # Treat this as a migration failure.
             pipe = self.r.pipeline()
+            # Keep set for retry, but also increment a dedicated counter.
             pipe.sadd(key(self.campaign_name, 'sets:failed'), file_path_bytes)
+            pipe.incr(key(self.campaign_name, 'counters:failed'))
             pipe.hset(key(self.campaign_name, 'errors'), file_path_bytes, str(e))
             pipe.execute()
             return True
@@ -400,6 +407,8 @@ class Worker:
             if self.dry_run:
                 logging.debug("[DRY-RUN] Would migrate file: %s", file_path_str)
                 time.sleep(0.01)
+                # In dry-run, assume success
+                rc = 0
             else:
                 logging.debug("Migrating file: %s", file_path_str)
                 base_cmd = APP_CONFIG.LFS_MIGRATE_COMMAND[:]
@@ -415,30 +424,44 @@ class Worker:
                 except subprocess.CalledProcessError as e:
                     rc = e.returncode
                     stderr_msg = e.stderr.decode('utf-8', 'ignore').strip()
-                    logging.warning(
-                        "Failed to migrate %s. RC=%d. Stderr: %s",
-                        file_path_str, rc, stderr_msg
-                    )
+                    if rc != 16: # Don't log expected "busy" errors as warnings
+                        logging.warning(
+                            "Failed to migrate %s. RC=%d. Stderr: %s",
+                            file_path_str, rc, stderr_msg
+                        )
                 except Exception as e:
-                    rc = -1
+                    rc = -1 # Generic failure code
                     stderr_msg = str(e)
                     logging.error(
                         "Unexpected error migrating %s: %s", file_path_str, e
                     )
 
-            # Update Redis state based on the outcome
+            # Classify outcome based on return code
             pipe = self.r.pipeline()
             if rc == 0:
+                # --- SUCCESS ---
                 self.files_migrated_succeeded += 1
                 self._update_migrate_rate()
-                pipe.sadd(key(self.campaign_name, 'sets:succeeded'), file_path_bytes)
+                pipe.incr(key(self.campaign_name, 'counters:succeeded'))
                 self._update_bandwidth_rate(file_size)
                 pipe.incrby(key(self.campaign_name, 'metrics:bytes_succeeded'), file_size)
                 if self.succeeded_log_file:
                     self.succeeded_log_file.write(f"{repr(file_path_str)}\n")
+
+            elif rc == 16:  # EBUSY - Device or resource busy
+                # --- SKIPPED (BUSY) ---
+                self.files_migrated_skipped += 1
+                logging.info("Skipped busy file (RC=16): %s", file_path_str)
+                pipe.sadd(key(self.campaign_name, 'sets:skipped'), file_path_bytes)
+                pipe.incr(key(self.campaign_name, 'counters:skipped'))
+                # NOTE: Skipped files are not added to the 'errors' hash or failed log.
+
             else:
+                # --- FAILED (REAL ERROR) ---
                 self.files_migrated_failed += 1
+                # Keep failed set for retry, but also increment a dedicated counter.
                 pipe.sadd(key(self.campaign_name, 'sets:failed'), file_path_bytes)
+                pipe.incr(key(self.campaign_name, 'counters:failed'))
                 pipe.hset(key(self.campaign_name, 'errors'), file_path_bytes, stderr_msg)
                 pipe.incrby(key(self.campaign_name, 'metrics:bytes_failed'), file_size)
                 if self.failed_log_file:

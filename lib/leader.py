@@ -182,9 +182,16 @@ class Daemon:
             if fh:
                 fh.close()
 
-    def _wait_for_redis(self, host='localhost', timeout=120):
+    def _wait_for_redis(self, host='localhost'):
         """Waits for a Redis server to become available."""
-        logging.info("Waiting for Redis server at %s:%s...", host, APP_CONFIG.REDIS_PORT)
+        # Make timeout configurable
+        timeout = APP_CONFIG.config.getint(
+            'main', 'redis_startup_timeout', fallback=120
+        )
+        logging.info(
+            "Waiting up to %d seconds for Redis server at %s:%s...",
+            timeout, host, APP_CONFIG.REDIS_PORT
+        )
         start_time = time.time()
         while time.time() - start_time < timeout:
             if self.shutdown_flag:

@@ -40,6 +40,7 @@ def get_metrics():
             "scans_completed": worker.scans_completed,
             "files_migrated_succeeded": worker.files_migrated_succeeded,
             "files_migrated_failed": worker.files_migrated_failed,
+            "files_migrated_skipped": worker.files_migrated_skipped,
         },
         "rates": {
             "migrate_rate_files_per_sec": worker.get_migrate_rate_per_sec(),
@@ -52,25 +53,29 @@ def get_metrics():
         pipe = r.pipeline()
         pipe.hget(key(campaign_name, 'campaign:state'), 'status')
         pipe.hget(key(campaign_name, 'campaign:state'), 'leader')
-        pipe.scard(key(campaign_name, 'sets:discovered'))
-        pipe.scard(key(campaign_name, 'sets:succeeded'))
-        pipe.scard(key(campaign_name, 'sets:failed'))
-        pipe.scard(key(campaign_name, 'sets:inprogress'))
+        pipe.get(key(campaign_name, 'counters:discovered'))
+        pipe.get(key(campaign_name, 'counters:succeeded'))
+        pipe.get(key(campaign_name, 'counters:failed'))
+        pipe.get(key(campaign_name, 'counters:skipped'))
+        # Use HLEN on the 'migrations:inprogress' HASH
+        pipe.hlen(key(campaign_name, 'migrations:inprogress'))
         pipe.llen(key(campaign_name, 'queues:scan'))
         pipe.llen(key(campaign_name, 'queues:migrate'))
         pipe.hlen(status_key)
 
         results = pipe.execute()
 
-        campaign_status_raw = results[0]
-        leader_raw = results[1]
-        discovered = results[2]
-        succeeded = results[3]
-        failed = results[4]
-        in_progress = results[5]
-        scan_q = results[6]
-        migrate_q = results[7]
-        active_workers = results[8]
+        campaign_status_raw, leader_raw, discovered_raw, succeeded_raw, \
+            failed_raw, skipped_raw, in_progress, scan_q, migrate_q, active_workers = results
+
+        discovered = int(discovered_raw or 0)
+        succeeded = int(succeeded_raw or 0)
+        skipped = int(skipped_raw or 0)
+        # For backward compatibility on old campaigns, check if the counter exists
+        if failed_raw is None:
+             failed = r.scard(key(campaign_name, 'sets:failed'))
+        else:
+             failed = int(failed_raw or 0)
 
         campaign_status = 'running'
         if campaign_status_raw:
@@ -90,6 +95,7 @@ def get_metrics():
                 "files_discovered": int(discovered),
                 "files_succeeded": int(succeeded),
                 "files_failed": int(failed),
+                "files_skipped": int(skipped),
                 "files_in_progress": int(in_progress),
             },
             "queues": {

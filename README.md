@@ -27,8 +27,8 @@ The system consists of a `lustre-migratord` daemon running on multiple nodes.
     1.  A campaign is defined with a set of `scan_paths`.
     2.  The leader primes a Redis `scan` queue with these paths.
     3.  Workers pop paths from the `scan` queue and run `lfs find` to discover files on the target OSTs.
-    4.  Discovered files are pushed to a Redis `migrate` queue.
-    5.  Workers pop file paths from the `migrate` queue and execute `lfs migrate` on them.
+    4.  Discovered files are pushed to a Redis `migrate` queue, and a global `discovered` counter is incremented.
+    5.  Workers pop file paths from the `migrate` queue, execute `lfs migrate`, and update `succeeded`, `skipped`, or `failed` counters based on the result.
 
 ---
 
@@ -101,25 +101,33 @@ systemctl start lustre-migratord@ost-evac-1
 systemctl start lustre-migratord@ost-evac-1
 ```
 
-### Step 5: Observe the Scaled-Up Status
+### Step 5: Monitor Progress
 
-Check the status again. You'll see more active workers, a higher migration rate, and a lower ETA.
+Check the status. You'll see multiple active workers, a higher migration rate, a list of in-progress files, and a lower ETA.
 
 ```bash
 /opt/lustre-migrator/lustre-migrator status ost-evac-1
 
 --- Campaign Status: ost-evac-1 ---
 State: RUNNING | Leader: node-01
-Active Workers: 4 (node-[01-04])
+Active Workers: 3 (node-[01-03])
 
-Progress: 450,831 / 1,250,000 files migrated (36.07%)
-[█████████.....................] | ETA: 1:08:05
-...
+Progress: 450,831 / 1,250,000 files processed (36.07% succeeded) (83.25 TiB)
+[█████████─────────────────────] | ETA: 1:08:05 at 1.21 GiB/s
+  - Succeeded: 450,831
+  - Skipped:   1,204 (file busy)
+  - Failed:    12 (real errors)
+
 Activity:
-  - Migrations In Progress (32) (Rate: 180 files/sec):
+  - Migrations In Progress (24) (Migration Rate: 180 files/sec):
     - /lustre/fs1/data/sim/result_1.dat (on node-01:MigrateWorker-1)
     - /lustre/fs1/data/raw/img_234.tif (on node-02:MigrateWorker-5)
     ...
+  - Scans In Progress: 0
+
+Queues:
+  - Scan Jobs Pending: 0
+  - Migrate Jobs Pending: 797,953
 ```
 
 ### Step 6: Complete the Campaign
@@ -185,7 +193,7 @@ dnf install python3-click python3-redis python3-clustershell python3-netifaces p
     ```systemd
     [Service]
     ...
-    ExecStart=/opt/lustre-migrator/lustre-migratord --campaign %i --log-level INFO --scan-workers 4 --migration-workers 8
+    ExecStart=/opt/lustre-migrator/lustre-migratord --campaign %i --log-level INFO --scan-workers 4 --migration-workers 8 --max-pending-migrations 25000000
     ...
     ```
     
@@ -228,8 +236,12 @@ Resumes a paused campaign.
 /opt/lustre-migrator/lustre-migrator resume <campaign_name>
 ```
 
+### `retry-skipped`
+Moves all "skipped" files (which were busy) back into the migration queue for another attempt.
+
 ### `retry-failed`
-Moves all files from the failed set back into the migration queue for another attempt.
+Moves all files from the "failed" set (which had real errors) back into the migration queue for another attempt.
+
 
 ```bash
 /opt/lustre-migrator/lustre-migrator retry-failed <campaign_name>
@@ -263,25 +275,27 @@ curl -s http://localhost:9188/metrics | jq
     "progress": {
       "files_discovered": 1250000,
       "files_failed": 0,
-      "files_in_progress": 0,
-      "files_succeeded": 450831
-    },
-    "queues": {
-      "migrate_jobs_pending": 799169,
       "scan_jobs_pending": 0
+    "files_in_progress": 24,
+    "files_skipped": 1204,
+    "files_succeeded": 450831
+  },
+  "queues": {
+    "migrate_jobs_pending": 797953,
     },
     "target_osts": "10-20"
   },
   "local_metrics": {
     "counters": {
       "files_migrated_failed": 0,
-      "files_migrated_succeeded": 112708,
+      "files_migrated_skipped": 401,
+      "files_migrated_succeeded": 150277,
       "scans_completed": 5
     },
     "hostname": "node-01",
     "rates": {
       "found_files_rate_per_sec": 0,
-      "migrate_rate_files_per_sec": 45.2
+      "migrate_rate_files_per_sec": 60.1
     },
     "status": "migrating"
   }

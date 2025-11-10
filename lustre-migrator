@@ -149,9 +149,10 @@ def status(campaign):
 
         pipe = r.pipeline()
         pipe.hgetall(key(campaign, 'campaign:state'))
-        pipe.scard(key(campaign, 'sets:discovered'))
-        pipe.scard(key(campaign, 'sets:succeeded'))
-        pipe.scard(key(campaign, 'sets:failed'))
+        pipe.get(key(campaign, 'counters:discovered'))
+        pipe.get(key(campaign, 'counters:succeeded'))
+        pipe.get(key(campaign, 'counters:failed'))
+        pipe.get(key(campaign, 'counters:skipped'))
         pipe.hgetall(key(campaign, 'migrations:inprogress'))
         pipe.llen(key(campaign, 'queues:scan'))
         pipe.llen(key(campaign, 'queues:migrate'))
@@ -166,10 +167,22 @@ def status(campaign):
         pipe.get(key(campaign, 'scan:throttling_active'))
         results = pipe.execute()
 
-        state_raw, discovered, succeeded, failed, active_migrations_raw, scan_q, \
-            migrate_q, workers_raw, active_scans_raw, scan_counts_raw, \
-            migrate_rates_raw, scan_rates_raw, bytes_succeeded_raw, \
+        state_raw, discovered_raw, succeeded_raw, failed_raw, skipped_raw, \
+            active_migrations_raw, scan_q, migrate_q, workers_raw, active_scans_raw, \
+            scan_counts_raw, migrate_rates_raw, scan_rates_raw, bytes_succeeded_raw, \
             bandwidth_rates_raw, bytes_failed_raw, is_throttled_raw = results
+
+        discovered = int(discovered_raw or 0)
+        succeeded = int(succeeded_raw or 0)
+        # Handle failed and skipped counts
+        skipped = int(skipped_raw or 0)
+        # For backward compatibility, if the failed counter doesn't exist,
+        # get the count from the old 'sets:failed'. This is a one-time
+        # state for your current campaign. New campaigns will use the counter.
+        if failed_raw is None:
+            failed = r.scard(key(campaign, 'sets:failed'))
+        else:
+            failed = int(failed_raw or 0)
 
         state = {k.decode(): v.decode() for k, v in state_raw.items()}
         active_migrations = {
@@ -221,7 +234,8 @@ def status(campaign):
         else:
             click.echo("Active Workers: 0")
 
-        files_remaining = discovered - (succeeded + failed)
+        # Update total remaining files logic
+        files_remaining = discovered - (succeeded + failed + skipped)
         global_rate_ps = sum(migrate_rates.values())
         global_scan_rate_ps = sum(scan_rates.values())
         global_bandwidth_bps = sum(bandwidth_rates.values())
@@ -229,8 +243,7 @@ def status(campaign):
 
         eta_str = click.style("Calculating...", dim=True)
         if scans_are_running:
-            # When scanning, the total number of files is unknown, so ETA is not applicable.
-            eta_str = click.style("N/A", fg='yellow')
+            eta_str = click.style("N/A (Scanning)", fg='yellow')
         elif files_remaining <= 0 and discovered > 0:
             eta_str = click.style("Complete.", fg='green', bold=True)
         elif global_rate_ps > 0:
@@ -242,13 +255,13 @@ def status(campaign):
                 eta_delta = timedelta(seconds=seconds_remaining) - timedelta(microseconds=timedelta(seconds=seconds_remaining).microseconds)
                 eta_str = f"{eta_delta}"
         elif discovered > 0:
-            # If migrations are active but rate is 0 (just started), it's not "Stalled"
             if in_progress > 0:
                 eta_str = click.style("Calculating...", dim=True)
             else:
                 eta_str = click.style("Stalled (rate is 0)", fg='red', bold=True)
 
         if discovered > 0:
+            # Progress bar still represents "Succeeded" vs "Discovered"
             percent_done = (succeeded / discovered) * 100
             bar_len = 30
             filled_len = int(bar_len * percent_done / 100)
@@ -256,33 +269,35 @@ def status(campaign):
             bar_empty = click.style('─' * (bar_len - filled_len), dim=True)
 
             bandwidth_str = ""
-            # Always show migration bandwidth if it's non-zero.
             if global_bandwidth_bps > 0:
                 bandwidth_str = f" at {format_bytes(global_bandwidth_bps)}/s"
 
             total_migrated_size = format_bytes(bytes_succeeded)
+            total_processed = succeeded + failed + skipped
 
             click.echo(
-                f"\nProgress: {click.style(f'{succeeded:,}', bold=True)} / "
-                f"{discovered:,} files migrated ({percent_done:.2f}%) "
+                f"\nProgress: {click.style(f'{total_processed:,}', bold=True)} / "
+                f"{discovered:,} files processed ({percent_done:.2f}% succeeded) "
                 f"({click.style(total_migrated_size, bold=True)})"
             )
             click.echo(f"[{bar_fill}{bar_empty}] | ETA: {eta_str}{bandwidth_str}")
 
+        # Display Succeeded, Skipped, and Failed
         succeeded_str = click.style(f'{succeeded:,}', fg='bright_green')
+        skipped_str = click.style(f'{skipped:,}', fg='yellow')
         failed_color = 'red' if failed > 0 else 'white'
         failed_str = click.style(f'{failed:,}', fg=failed_color, bold=failed > 0)
         if failed > 0 and bytes_failed > 0:
             failed_bytes_str = click.style(f" ({format_bytes(bytes_failed)})", fg=failed_color, bold=True)
             failed_str += failed_bytes_str
         click.echo(f"  - Succeeded: {succeeded_str}")
-        click.echo(f"  - Failed: {failed_str}")
+        click.echo(f"  - Skipped:   {skipped_str} (file busy)")
+        click.echo(f"  - Failed:    {failed_str} (real errors)")
 
         click.echo(f"\n{click.style('Activity:', bold=True)}")
         migrate_rate_str = format_rate(global_rate_ps)
         scan_rate_str = format_rate(global_scan_rate_ps)
 
-        # Display list of migrating files
         if active_migrations:
             click.echo(
                 f"  - Migrations In Progress ({in_progress}) "
@@ -360,22 +375,51 @@ def resume(campaign):
 
 @cli.command()
 @click.argument('campaign')
+def retry_skipped(campaign):
+    """Re-queues all skipped (busy) files for another migration attempt."""
+    try:
+        r = get_redis_connection(campaign)
+        skipped_files = r.smembers(key(campaign, 'sets:skipped'))
+        if not skipped_files:
+            click.echo("No skipped files to retry.")
+            return
+
+        click.echo(f"Re-queueing {len(skipped_files)} skipped files...")
+        pipe = r.pipeline()
+        pipe.rpush(key(campaign, 'queues:migrate'), *skipped_files)
+        pipe.srem(key(campaign, 'sets:skipped'), *skipped_files)
+        pipe.decrby(key(campaign, 'counters:skipped'), len(skipped_files))
+        pipe.execute()
+        click.echo("Done.")
+    except Exception as e:
+        click.echo(f"Error re-queueing skipped files: {e}", err=True)
+
+@cli.command()
+@click.argument('campaign')
 def retry_failed(campaign):
-    """Re-queues all failed files for another migration attempt."""
+    """Re-queues all failed files (with real errors) for another attempt."""
     try:
         r = get_redis_connection(campaign)
         failed_files = r.smembers(key(campaign, 'sets:failed'))
         if not failed_files:
             click.echo("No failed files to retry.")
             return
+
         click.echo(f"Re-queueing {len(failed_files)} failed files...")
-        error_keys = set(r.hkeys(key(campaign, 'errors')))
-        files_to_remove = error_keys.intersection(failed_files)
+        # Also find and remove their corresponding error messages
+        error_keys_to_remove = set()
+        for f in failed_files:
+             # Ensure we're dealing with bytes for the set intersection
+             error_keys_to_remove.add(f)
+
         pipe = r.pipeline()
         pipe.rpush(key(campaign, 'queues:migrate'), *failed_files)
         pipe.srem(key(campaign, 'sets:failed'), *failed_files)
-        if files_to_remove:
-            pipe.hdel(key(campaign, 'errors'), *files_to_remove)
+        if r.exists(key(campaign, 'counters:failed')):
+            pipe.decrby(key(campaign, 'counters:failed'), len(failed_files))
+
+        if error_keys_to_remove:
+            pipe.hdel(key(campaign, 'errors'), *error_keys_to_remove)
         pipe.execute()
         click.echo("Done.")
     except Exception as e:
